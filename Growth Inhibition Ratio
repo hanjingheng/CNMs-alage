@@ -1,0 +1,547 @@
+#### Import package ====
+library(ggplot2)
+library(mice)
+library(randomForest)
+library(varSelRF)
+library(pROC)
+library(corrplot)
+library(DescTools)
+library(shape)
+library(survival)
+library(dplyr)
+library(caret)
+library(gmodels)
+library(ROCR)
+library(e1071)
+library(xgboost)
+library(rBayesianOptimization)
+library(Metrics)
+library(ggsci)
+library(patchwork)
+library(ggbump)
+library(catboost)
+library(cowplot)
+library(lattice)
+library(DescTools)
+#### Import data ====
+data <- read.csv("inhibition.csv")
+
+#### Multiple interpolation ====
+mice_mod <- mice(data = data,
+                 m = 5,
+                 method = 'rf',
+                 maxit = 5,
+                 seed = 12345678)
+stip_mice <- mice_mod
+
+no_strip <- function(which.given, which.panel, ...) {
+}
+stripplot(mice_mod,pch = 20, cex = 1.5,strip = no_strip) #View the interpolation
+
+paste(colnames(data),collapse = "+")
+medelFit1 <- with(mice_mod, glm(inhibition ~ Species+Water+CNMs+Dimension+Shape+Length+Diameter+Thickness+Zeta+Medium+RPM+C.+Modification+Dispersant+Duration+LightI+Temperature+LightD+Conc.+N, family = gaussian()))
+medelFit1
+summary(medelFit1, type = "glance") #Selective data set
+
+mice_data <- complete(mice_mod,action = 2)
+
+#### Recursive feature elimination ====
+#Max-min standardization
+normalize <- function(x) {
+  return ((x - min(x)) / (max(x) - min(x)))
+}
+stand_data <- as.data.frame(lapply(mice_data,normalize))
+
+#Divide the test set
+set.seed(12345678)
+test_Index = createDataPartition(stand_data$inhibition, p = .1,   #Stratified sampling divides the test set
+                                     list = F,
+                                     times = 1)
+test_data <- stand_data[test_Index,]
+cross_data <- stand_data[-test_Index,]
+
+rownames(cross_data) <- 1:nrow(cross_data)  #"Reset sequence number."
+rownames(test_data) <- 1:nrow(test_data)
+
+#Variable selection
+subsets <- 1:(ncol(cross_data)-2)
+ctrl <- rfeControl(functions = rfFuncs, method = "CV", number = 10)
+set.seed(123456789)
+Profile <- rfe(x = cross_data[-ncol(cross_data)],
+               y = cross_data$inhibition,
+               metric = "Rsquared",
+               sizes = subsets,
+               rfeControl = ctrl)
+
+Profile$optVariables
+profile_result <- Profile$results
+
+optVariables <- Profile$optVariables
+test_data <- test_data[,c(optVariables,"inhibition")]
+cross_data <- cross_data[,c(optVariables,"inhibition")]
+
+
+#R2
+r2_general <-function(preds,actual){
+  return(1- sum((preds - actual) ^ 2)/sum((actual - mean(actual))^2))
+}
+
+#### Ten-fold cross-validation ====
+set.seed(12345678)
+cross_num <- createFolds(cross_data$inhibition, k = 10)
+traindata1 <- cross_data[-cross_num[[1]],]
+validationdata1 <- cross_data[cross_num[[1]],]
+traindata2 <- cross_data[-cross_num[[2]],]
+validationdata2 <- cross_data[cross_num[[2]],]
+traindata3 <- cross_data[-cross_num[[3]],]
+validationdata3 <- cross_data[cross_num[[3]],]
+traindata4 <- cross_data[-cross_num[[4]],]
+validationdata4 <- cross_data[cross_num[[4]],]
+traindata5 <- cross_data[-cross_num[[5]],]
+validationdata5 <- cross_data[cross_num[[5]],]
+traindata6 <- cross_data[-cross_num[[6]],]
+validationdata6 <- cross_data[cross_num[[6]],]
+traindata7 <- cross_data[-cross_num[[7]],]
+validationdata7 <- cross_data[cross_num[[7]],]
+traindata8 <- cross_data[-cross_num[[8]],]
+validationdata8 <- cross_data[cross_num[[8]],]
+traindata9 <- cross_data[-cross_num[[9]],]
+validationdata9 <- cross_data[cross_num[[9]],]
+traindata10 <- cross_data[-cross_num[[10]],]
+validationdata10 <- cross_data[cross_num[[10]],]
+
+train_list <- list(traindata1,traindata2,traindata3,traindata4,traindata5,traindata6,traindata7,traindata8,traindata9,traindata10)
+validation_list <- list(validationdata1,validationdata2,validationdata3,validationdata4,validationdata5,validationdata6,validationdata7,validationdata8,validationdata9,validationdata10)
+train_list[[i]]
+validation_list[[i]]
+#### RF ====
+rf_data <- as.data.frame(matrix(nrow = 10,ncol = 7))
+colnames(rf_data) <- c('ntree','mtry','nodesize','maxnodes','train_R','validate_R','test_R')
+
+for (i in 1:10) {
+  RF_FUN <- function(ntree,mtry,nodesize,maxnodes){
+    rf_f <- randomForest(inhibition ~.,
+                         data = train_list[[i]],
+                         important = F,
+                         proximity = T,
+                         ntree = ntree,
+                         mtry = mtry,
+                         nodesize = nodesize,
+                         maxnodes = maxnodes)
+    list(Score = r2_general(predict(rf_f,validation_list[[i]]),validation_list[[i]]$inhibition),
+         Pred = predict(rf_f,validation_list[[i]]))
+  }
+  
+  set.seed(12345678)
+  OPT_RF <- BayesianOptimization(RF_FUN,
+                                 bounds = list(ntree = c(100L,500L),
+                                               mtry = c(2L,9L),
+                                               nodesize = c(1L,20L),
+                                               maxnodes = c(100L,600L)),
+                                 init_grid_dt = NULL,
+                                 init_points = 40,
+                                 n_iter = 40,
+                                 acq = "ucb",
+                                 kappa = 2.576,
+                                 eps = 0.0,
+                                 verbose = T)
+  set.seed(12345678)
+  rf_f <- randomForest(inhibition ~.,
+                       data = train_list[[i]],
+                       important = F,
+                       proximity = T,
+                       ntree = OPT_RF$Best_Par[c("ntree")],
+                       mtry = OPT_RF$Best_Par[c("mtry")],
+                       nodesize = OPT_RF$Best_Par[c("nodesize")],
+                       maxnodes = OPT_RF$Best_Par[c("maxnodes")])
+  rf_data[i,1] <- OPT_RF$Best_Par[c("ntree")]
+  rf_data[i,2] <- OPT_RF$Best_Par[c("mtry")]
+  rf_data[i,3] <- OPT_RF$Best_Par[c("nodesize")]
+  rf_data[i,4] <- OPT_RF$Best_Par[c("maxnodes")]
+  rf_data[i,5] <- r2_general(rf_f$predicted,train_list[[i]]$inhibition)
+  rf_data[i,6] <- r2_general(predict(rf_f,validation_list[[i]]),validation_list[[i]]$inhibition)
+  rf_data[i,7] <- r2_general(predict(rf_f,test_data),test_data$inhibition)
+}
+
+#### SVM ====
+svm_data <- as.data.frame(matrix(nrow = 10,ncol = 5))
+colnames(svm_data) <- c('gamma','cost','train_R','validate_R','test_R')
+
+for (i in 1:10) {
+  SVM_FUN <- function(gamma,cost){
+    svm_f <- svm(inhibition ~.,
+                 data = train_list[[i]],
+                 scale = F,
+                 type = "eps-regression",
+                 kernel = "radial",
+                 gamma = 10^gamma,
+                 C = 10^cost)
+    list(Score = r2_general(predict(svm_f,validation_list[[i]]),validation_list[[i]]$inhibition),
+         Pred = predict(svm_f,validation_list[[i]]))
+  }
+  set.seed(12345678)
+  OPT_SVM <- BayesianOptimization(SVM_FUN,
+                                  bounds = list(gamma = c(-4,1),
+                                                cost = c(-4,1)),
+                                  init_grid_dt = NULL,
+                                  init_points = 40,
+                                  n_iter = 40,
+                                  acq = "ucb",
+                                  kappa = 2.576,
+                                  eps = 0.0,
+                                  verbose = T)
+  set.seed(12345678)
+  svm_f <- svm(inhibition ~.,
+               data = train_list[[i]],
+               scale = F,
+               type = "eps-regression",
+               kernel = "radial",
+               gamma = 10^OPT_SVM$Best_Par[c("gamma")],
+               C = 10^OPT_SVM$Best_Par[c("cost")])
+  svm_data[i,1] <- 10^OPT_SVM$Best_Par[c("gamma")]
+  svm_data[i,2] <- 10^OPT_SVM$Best_Par[c("cost")]
+  svm_data[i,3] <- r2_general(svm_f$decision.values,train_list[[i]]$inhibition)
+  svm_data[i,4] <- r2_general(predict(svm_f,validation_list[[i]]),validation_list[[i]]$inhibition)
+  svm_data[i,5] <- r2_general(predict(svm_f,test_data),test_data$inhibition)
+}
+
+#### knn ====
+knn_data <- as.data.frame(matrix(nrow = 10,ncol = 4))
+colnames(knn_data) <- c('k','train_R','validate_R','test_R')
+
+for (i in 1:10) {
+  KNN_FUN <- function(k){
+    knn_f <- knnreg(inhibition ~.,
+                    data = train_list[[i]],
+                    k = k)
+    list(Score = r2_general(predict(knn_f,validation_list[[i]]),validation_list[[i]]$inhibition),
+         Pred = predict(knn_f,validation_list[[i]]))
+  }
+  set.seed(12345678)
+  OPT_KNN <- BayesianOptimization(KNN_FUN,
+                                  bounds = list(k = c(1L,200L)),
+                                  init_grid_dt = NULL,
+                                  init_points = 40,
+                                  n_iter = 40,
+                                  acq = "ucb",
+                                  kappa = 2.576,
+                                  eps = 0.0,
+                                  verbose = T)
+  set.seed(12345678)
+  knn_f <- knnreg(inhibition ~.,
+                  data = train_list[[i]],
+                  k = OPT_KNN$Best_Par[c("k")])
+  knn_data[i,1] <- OPT_KNN$Best_Par[c("k")]
+  knn_data[i,2] <- r2_general(predict(knn_f,train_list[[i]]),train_list[[i]]$inhibition)
+  knn_data[i,3] <- r2_general(predict(knn_f,validation_list[[i]]),validation_list[[i]]$inhibition)
+  knn_data[i,4] <- r2_general(predict(knn_f,test_data),test_data$inhibition)
+}
+#### xgb ====
+xgb_data <- as.data.frame(matrix(nrow = 10, ncol = 9))
+colnames(xgb_data) <- c('eta','max_depth','min_child_weight','gamma','subsample','colsample_bytree','train_R','validate_R','test_R')
+
+xgbtraindata1 <- xgb.DMatrix(data = data.matrix(select(traindata1,-inhibition)),
+                             label = traindata1$inhibition)
+xgbvalidationdata1 <- xgb.DMatrix(data = data.matrix(select(validationdata1,-inhibition)),
+                                  label = validationdata1$inhibition)
+xgbtraindata2 <- xgb.DMatrix(data = data.matrix(select(traindata2,-inhibition)),
+                             label = traindata2$inhibition)
+xgbvalidationdata2 <- xgb.DMatrix(data = data.matrix(select(validationdata2,-inhibition)),
+                                  label = validationdata2$inhibition)
+xgbtraindata3 <- xgb.DMatrix(data = data.matrix(select(traindata3,-inhibition)),
+                             label = traindata3$inhibition)
+xgbvalidationdata3 <- xgb.DMatrix(data = data.matrix(select(validationdata3,-inhibition)),
+                                  label = validationdata3$inhibition)
+xgbtraindata4 <- xgb.DMatrix(data = data.matrix(select(traindata4,-inhibition)),
+                             label = traindata4$inhibition)
+xgbvalidationdata4 <- xgb.DMatrix(data = data.matrix(select(validationdata4,-inhibition)),
+                                  label = validationdata4$inhibition)
+xgbtraindata5 <- xgb.DMatrix(data = data.matrix(select(traindata5,-inhibition)),
+                             label = traindata5$inhibition)
+xgbvalidationdata5 <- xgb.DMatrix(data = data.matrix(select(validationdata5,-inhibition)),
+                                  label = validationdata5$inhibition)
+xgbtraindata6 <- xgb.DMatrix(data = data.matrix(select(traindata6,-inhibition)),
+                             label = traindata6$inhibition)
+xgbvalidationdata6 <- xgb.DMatrix(data = data.matrix(select(validationdata6,-inhibition)),
+                                  label = validationdata6$inhibition)
+xgbtraindata7 <- xgb.DMatrix(data = data.matrix(select(traindata7,-inhibition)),
+                             label = traindata7$inhibition)
+xgbvalidationdata7 <- xgb.DMatrix(data = data.matrix(select(validationdata7,-inhibition)),
+                                  label = validationdata7$inhibition)
+xgbtraindata8 <- xgb.DMatrix(data = data.matrix(select(traindata8,-inhibition)),
+                             label = traindata8$inhibition)
+xgbvalidationdata8 <- xgb.DMatrix(data = data.matrix(select(validationdata8,-inhibition)),
+                                  label = validationdata8$inhibition)
+xgbtraindata9 <- xgb.DMatrix(data = data.matrix(select(traindata9,-inhibition)),
+                             label = traindata9$inhibition)
+xgbvalidationdata9 <- xgb.DMatrix(data = data.matrix(select(validationdata9,-inhibition)),
+                                  label = validationdata9$inhibition)
+xgbtraindata10 <- xgb.DMatrix(data = data.matrix(select(traindata10,-inhibition)),
+                              label = traindata10$inhibition)
+xgbvalidationdata10 <- xgb.DMatrix(data = data.matrix(select(validationdata10,-inhibition)),
+                                   label = validationdata10$inhibition)
+xgbtestdata <- xgb.DMatrix(data = data.matrix(select(test_data,-inhibition)),
+                           label = test_data$inhibition)
+xgb_train_list <- list(xgbtraindata1,xgbtraindata2,xgbtraindata3,xgbtraindata4,xgbtraindata5,xgbtraindata6,xgbtraindata7,xgbtraindata8,xgbtraindata9,xgbtraindata10)
+xgb_validation_list <- list(xgbvalidationdata1,xgbvalidationdata2,xgbvalidationdata3,xgbvalidationdata4,xgbvalidationdata5,xgbvalidationdata6,xgbvalidationdata7,xgbvalidationdata8,xgbvalidationdata9,xgbvalidationdata10)
+
+for (i in 1:10) {
+  XGB_FUN <- function(eta,max_depth,min_child_weight,gamma,subsample,colsample_bytree){
+    xgb_f <- xgboost(data = xgb_train_list[[i]],
+                     eta = eta,
+                     max_depth = max_depth,
+                     min_child_weight = min_child_weight,
+                     gamma = gamma,
+                     subsample = subsample,
+                     colsample_bytree = colsample_bytree,
+                     objective = "reg:squarederror",
+                     nrounds = 1000,
+                     early_stopping_rounds = 200,
+                     verbose = 0)
+    list(Score = r2_general(predict(xgb_f,xgb_validation_list[[i]]),validation_list[[i]]$inhibition),
+         Pred = predict(xgb_f,xgb_validation_list[[i]]))
+  }
+  set.seed(12345678)
+  OPT_XGB <- BayesianOptimization(XGB_FUN,
+                                  bounds = list(eta = c(0.01,0.3),
+                                                max_depth = c(3L,10L),
+                                                min_child_weight = c(0.5,1.5),
+                                                gamma = c(0,0.2),
+                                                subsample = c(0.5,1),
+                                                colsample_bytree = c(0.5,1)),
+                                  init_grid_dt = NULL,
+                                  init_points = 40,
+                                  n_iter = 40,
+                                  acq = "ucb",
+                                  kappa = 2.576,
+                                  eps = 0.0,
+                                  verbose = T)
+  set.seed(12345678)
+  xgb_f <- xgboost(data = xgb_train_list[[i]],
+                   eta = OPT_XGB$Best_Par[c("eta")],
+                   max_depth = OPT_XGB$Best_Par[c("max_depth")],
+                   min_child_weight = OPT_XGB$Best_Par[c("min_child_weight")],
+                   gamma = OPT_XGB$Best_Par[c("gamma")],
+                   subsample = OPT_XGB$Best_Par[c("subsample")],
+                   colsample_bytree = OPT_XGB$Best_Par[c("colsample_bytree")],
+                   objective = "reg:squarederror",
+                   nrounds = 1000,
+                   early_stopping_rounds = 200,
+                   verbose = 0)
+  xgb_data[i,1] <- OPT_XGB$Best_Par[c("eta")]
+  xgb_data[i,2] <- OPT_XGB$Best_Par[c("max_depth")]
+  xgb_data[i,3] <- OPT_XGB$Best_Par[c("min_child_weight")]
+  xgb_data[i,4] <- OPT_XGB$Best_Par[c("gamma")]
+  xgb_data[i,5] <- OPT_XGB$Best_Par[c("subsample")]
+  xgb_data[i,6] <- OPT_XGB$Best_Par[c("colsample_bytree")]
+  xgb_data[i,7] <- r2_general(predict(xgb_f,xgb_train_list[[i]]),train_list[[i]]$inhibition)
+  xgb_data[i,8] <- OPT_XGB$Best_Value
+  xgb_data[i,9] <- r2_general(predict(xgb_f,xgbtestdata),test_data$inhibition)
+}
+#### cat ====
+library(catboost)
+cat_data <- as.data.frame(matrix(nrow = 10,ncol = 10))
+colnames(cat_data) <- c('iterations','learning_rate','depth','bagging_temperature','subsample','l2_leaf_reg','random_strength','train_R','validate_R','test_R')
+
+cattraindata1 <- catboost.load_pool(data = data.matrix(select(traindata1,-inhibition)),
+                                    label = traindata1$inhibition)
+catvalidationdata1 <- catboost.load_pool(data = data.matrix(select(validationdata1,-inhibition)),
+                                         label = validationdata1$inhibition)
+cattraindata2 <- catboost.load_pool(data = data.matrix(select(traindata2,-inhibition)),
+                                    label = traindata2$inhibition)
+catvalidationdata2 <- catboost.load_pool(data = data.matrix(select(validationdata2,-inhibition)),
+                                         label = validationdata2$inhibition)
+cattraindata3 <- catboost.load_pool(data = data.matrix(select(traindata3,-inhibition)),
+                                    label = traindata3$inhibition)
+catvalidationdata3 <- catboost.load_pool(data = data.matrix(select(validationdata3,-inhibition)),
+                                         label = validationdata3$inhibition)
+cattraindata4 <- catboost.load_pool(data = data.matrix(select(traindata4,-inhibition)),
+                                    label = traindata4$inhibition)
+catvalidationdata4 <- catboost.load_pool(data = data.matrix(select(validationdata4,-inhibition)),
+                                         label = validationdata4$inhibition)
+cattraindata5 <- catboost.load_pool(data = data.matrix(select(traindata5,-inhibition)),
+                                    label = traindata5$inhibition)
+catvalidationdata5 <- catboost.load_pool(data = data.matrix(select(validationdata5,-inhibition)),
+                                         label = validationdata5$inhibition)
+cattraindata6 <- catboost.load_pool(data = data.matrix(select(traindata6,-inhibition)),
+                                    label = traindata6$inhibition)
+catvalidationdata6 <- catboost.load_pool(data = data.matrix(select(validationdata6,-inhibition)),
+                                         label = validationdata6$inhibition)
+cattraindata7 <- catboost.load_pool(data = data.matrix(select(traindata7,-inhibition)),
+                                    label = traindata7$inhibition)
+catvalidationdata7 <- catboost.load_pool(data = data.matrix(select(validationdata7,-inhibition)),
+                                         label = validationdata7$inhibition)
+cattraindata8 <- catboost.load_pool(data = data.matrix(select(traindata8,-inhibition)),
+                                    label = traindata8$inhibition)
+catvalidationdata8 <- catboost.load_pool(data = data.matrix(select(validationdata8,-inhibition)),
+                                         label = validationdata8$inhibition)
+cattraindata9 <- catboost.load_pool(data = data.matrix(select(traindata9,-inhibition)),
+                                    label = traindata9$inhibition)
+catvalidationdata9 <- catboost.load_pool(data = data.matrix(select(validationdata9,-inhibition)),
+                                         label = validationdata9$inhibition)
+cattraindata10 <- catboost.load_pool(data = data.matrix(select(traindata10,-inhibition)),
+                                     label = traindata10$inhibition)
+catvalidationdata10 <- catboost.load_pool(data = data.matrix(select(validationdata10,-inhibition)),
+                                          label = validationdata10$inhibition)
+cattestdata <- catboost.load_pool(data = data.matrix(select(test_data,-inhibition)),
+                                  label = test_data$inhibition)
+cat_train_list <- list(cattraindata1,cattraindata2,cattraindata3,cattraindata4,cattraindata5,cattraindata6,cattraindata7,cattraindata8,cattraindata9,cattraindata10)
+cat_validation_list <- list(catvalidationdata1,catvalidationdata2,catvalidationdata3,catvalidationdata4,catvalidationdata5,catvalidationdata6,catvalidationdata7,catvalidationdata8,catvalidationdata9,catvalidationdata10)
+
+for (i in 1:10) {
+  CAT_FUN <- function(iterations,learning_rate,depth,bagging_temperature,subsample,l2_leaf_reg,random_strength){
+    cat_f <- catboost.train(learn_pool = cat_train_list[[i]],
+                            params = list(iterations = iterations,
+                                          learning_rate = learning_rate,
+                                          depth = depth,
+                                          bagging_temperature = bagging_temperature,
+                                          subsample = subsample,
+                                          l2_leaf_reg = l2_leaf_reg,
+                                          random_strength = random_strength,
+                                          od_wait = 100,
+                                          random_seed = 12345678,
+                                          verbose = 0))
+    list(Score = r2_general(catboost.predict(cat_f,cat_validation_list[[i]]),validation_list[[i]]$inhibition),
+         Pred = catboost.predict(cat_f,cat_validation_list[[i]]))
+  }
+  
+  set.seed(12345678)
+  OPT_CAT <- BayesianOptimization(CAT_FUN,
+                                  bounds = list(iterations = c(100L,1200L),
+                                                learning_rate = c(0.01,0.3),
+                                                depth = c(4L,12L),
+                                                bagging_temperature = c(0,1),
+                                                subsample = c(0.5,1),
+                                                l2_leaf_reg = c(0.01,4),
+                                                random_strength = c(0.5,1.5)),
+                                  init_grid_dt = NULL,
+                                  init_points = 40,
+                                  n_iter = 40,
+                                  acq = "ucb",
+                                  kappa = 2.576,
+                                  eps = 0.0,
+                                  verbose = T)
+  set.seed(12345678)
+  cat_f <- catboost.train(learn_pool = cat_train_list[[i]],
+                          params = list(iterations = OPT_CAT$Best_Par[c("iterations")],
+                                        learning_rate = OPT_CAT$Best_Par[c("learning_rate")],
+                                        depth = OPT_CAT$Best_Par[c("depth")],
+                                        bagging_temperature = OPT_CAT$Best_Par[c("bagging_temperature")],
+                                        subsample = OPT_CAT$Best_Par[c("subsample")],
+                                        l2_leaf_reg = OPT_CAT$Best_Par[c("l2_leaf_reg")],
+                                        random_strength = OPT_CAT$Best_Par[c("random_strength")],
+                                        od_wait = 100,
+                                        random_seed = 12345678,
+                                        verbose = 0))
+  cat_data[i,1] <- OPT_CAT$Best_Par[c("iterations")]
+  cat_data[i,2] <- OPT_CAT$Best_Par[c("learning_rate")]
+  cat_data[i,3] <- OPT_CAT$Best_Par[c("depth")]
+  cat_data[i,4] <- OPT_CAT$Best_Par[c("bagging_temperature")]
+  cat_data[i,5] <- OPT_CAT$Best_Par[c("subsample")]
+  cat_data[i,6] <- OPT_CAT$Best_Par[c("l2_leaf_reg")]
+  cat_data[i,7] <- OPT_CAT$Best_Par[c("random_strength")]
+  cat_data[i,8] <- r2_general(catboost.predict(cat_f,cat_train_list[[i]]),train_list[[i]]$inhibition)
+  cat_data[i,9] <- OPT_CAT$Best_Value
+  cat_data[i,10] <- r2_general(catboost.predict(cat_f,cattestdata),test_data$inhibition)
+}
+
+#### light ====
+library(lightgbm)
+light_data <- as.data.frame(matrix(nrow = 10,ncol = 9))
+colnames(light_data) <- c("learning_rate","max_depth","num_leaves","subsample","colsample_bytree","num_iterations","train_R","validate_R","test_R")
+
+lighttraindata1 <- lgb.Dataset(data = data.matrix(select(traindata1,-inhibition)),
+                               label = traindata1$inhibition)
+lightvalidationdata1 <- lgb.Dataset(data = data.matrix(select(validationdata1,-inhibition)),
+                                    label = validationdata1$inhibition)
+lighttraindata2 <- lgb.Dataset(data = data.matrix(select(traindata2,-inhibition)),
+                               label = traindata2$inhibition)
+lightvalidationdata2 <- lgb.Dataset(data = data.matrix(select(validationdata2,-inhibition)),
+                                    label = validationdata2$inhibition)
+lighttraindata3 <- lgb.Dataset(data = data.matrix(select(traindata3,-inhibition)),
+                               label = traindata3$inhibition)
+lightvalidationdata3 <- lgb.Dataset(data = data.matrix(select(validationdata3,-inhibition)),
+                                    label = validationdata3$inhibition)
+lighttraindata4 <- lgb.Dataset(data = data.matrix(select(traindata4,-inhibition)),
+                               label = traindata4$inhibition)
+lightvalidationdata4 <- lgb.Dataset(data = data.matrix(select(validationdata4,-inhibition)),
+                                    label = validationdata4$inhibition)
+lighttraindata5 <- lgb.Dataset(data = data.matrix(select(traindata5,-inhibition)),
+                               label = traindata5$inhibition)
+lightvalidationdata5 <- lgb.Dataset(data = data.matrix(select(validationdata5,-inhibition)),
+                                    label = validationdata5$inhibition)
+lighttraindata6 <- lgb.Dataset(data = data.matrix(select(traindata6,-inhibition)),
+                               label = traindata6$inhibition)
+lightvalidationdata6 <- lgb.Dataset(data = data.matrix(select(validationdata6,-inhibition)),
+                                    label = validationdata6$inhibition)
+lighttraindata7 <- lgb.Dataset(data = data.matrix(select(traindata7,-inhibition)),
+                               label = traindata7$inhibition)
+lightvalidationdata7 <- lgb.Dataset(data = data.matrix(select(validationdata7,-inhibition)),
+                                    label = validationdata7$inhibition)
+lighttraindata8 <- lgb.Dataset(data = data.matrix(select(traindata8,-inhibition)),
+                               label = traindata8$inhibition)
+lightvalidationdata8 <- lgb.Dataset(data = data.matrix(select(validationdata8,-inhibition)),
+                                    label = validationdata8$inhibition)
+lighttraindata9 <- lgb.Dataset(data = data.matrix(select(traindata9,-inhibition)),
+                               label = traindata9$inhibition)
+lightvalidationdata9 <- lgb.Dataset(data = data.matrix(select(validationdata9,-inhibition)),
+                                    label = validationdata9$inhibition)
+lighttraindata10 <- lgb.Dataset(data = data.matrix(select(traindata10,-inhibition)),
+                                label = traindata10$inhibition)
+lightvalidationdata10 <- lgb.Dataset(data = data.matrix(select(validationdata10,-inhibition)),
+                                     label = validationdata10$inhibition)
+light_train_list <- list(lighttraindata1,lighttraindata2,lighttraindata3,lighttraindata4,lighttraindata5,lighttraindata6,lighttraindata7,lighttraindata8,lighttraindata9,lighttraindata10)
+light_validation <- list(lightvalidationdata1,lightvalidationdata2,lightvalidationdata3,lightvalidationdata4,lightvalidationdata5,lightvalidationdata6,lightvalidationdata7,lightvalidationdata8,lightvalidationdata9,lightvalidationdata10)
+
+for (i in 1:10) {
+  LIGHT_FUN <- function(learning_rate,max_depth,num_leaves,subsample,colsample_bytree,num_iterations){
+    light_f <- lgb.train(data = light_train_list[[i]],
+                         params = list(boosting_type = 'gbdt',
+                                       objective = 'regression',
+                                       learning_rate = learning_rate,
+                                       max_depth = max_depth,
+                                       num_leaves = num_leaves,
+                                       subsample = subsample,
+                                       colsample_bytree = colsample_bytree,
+                                       num_iterations = num_iterations),
+                         verbose = -1)
+    list(Score = r2_general(predict(light_f,data.matrix(select(validation_list[[i]],-inhibition))),validation_list[[i]]$inhibition),
+         Pred = predict(light_f,data.matrix(select(validation_list[[i]],-inhibition))))
+  }
+  
+  OPT_LIGHT <- BayesianOptimization(LIGHT_FUN,
+                                    bounds = list(learning_rate = c(0.01,0.1),
+                                                  max_depth = c(5L,25L),
+                                                  num_leaves = c(5L,60L),
+                                                  subsample = c(0.5,1),
+                                                  colsample_bytree = c(0.5,1),
+                                                  num_iterations = c(100L,1000L)),
+                                    init_grid_dt = NULL,
+                                    init_points = 40,
+                                    n_iter = 40,
+                                    acq = "ucb",
+                                    kappa = 2.576,
+                                    eps = 0.0,
+                                    verbose = T)
+  
+  light_f <- lgb.train(data = light_train_list[[i]],
+                       params = list(boosting_type = 'gbdt',
+                                     objective = 'regression',
+                                     learning_rate = OPT_LIGHT$Best_Par["learning_rate"],
+                                     max_depth = OPT_LIGHT$Best_Par["max_depth"],
+                                     num_leaves = OPT_LIGHT$Best_Par["num_leaves"],
+                                     subsample = OPT_LIGHT$Best_Par["subsample"],
+                                     colsample_bytree = OPT_LIGHT$Best_Par["colsample_bytree"],
+                                     num_iterations = OPT_LIGHT$Best_Par["num_iterations"]),
+                       verbose = -1)
+  
+  light_data[i,1] <- OPT_LIGHT$Best_Par["learning_rate"]
+  light_data[i,2] <- OPT_LIGHT$Best_Par["max_depth"]
+  light_data[i,3] <- OPT_LIGHT$Best_Par["num_leaves"]
+  light_data[i,4] <- OPT_LIGHT$Best_Par["subsample"]
+  light_data[i,5] <- OPT_LIGHT$Best_Par["colsample_bytree"]
+  light_data[i,6] <- OPT_LIGHT$Best_Par["num_iterations"]
+  light_data[i,7] <- r2_general(predict(light_f,data.matrix(select(train_list[[i]],-inhibition))),train_list[[i]]$inhibition)
+  light_data[i,8] <- OPT_LIGHT$Best_Value
+  light_data[i,9] <- r2_general(predict(light_f,data.matrix(select(test_data,-inhibition))),test_data$inhibition)
+}
