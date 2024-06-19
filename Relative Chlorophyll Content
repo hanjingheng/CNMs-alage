@@ -1,0 +1,401 @@
+#### Import package ====
+library(ggplot2)
+library(mice)
+library(randomForest)
+library(varSelRF)
+library(pROC)
+library(corrplot)
+library(DescTools)
+library(shape)
+library(survival)
+library(dplyr)
+library(caret)
+library(gmodels)
+library(ROCR)
+library(e1071)
+library(xgboost)
+library(rBayesianOptimization)
+library(Metrics)
+library(ggsci)
+library(patchwork)
+library(ggbump)
+library(ggalluvial)
+library(cowplot)
+library(corrplot)
+#### Import data ====
+data <- read.csv("chlorophyll.csv")
+
+
+#### Multiple interpolation ====
+mice_mod <- mice(data = data,
+                 m = 5,
+                 method = 'rf',
+                 maxit = 5,
+                 seed = 1234567)
+mice_mod
+
+stip_mice <- mice_mod
+
+no_strip <- function(which.given, which.panel, ...) {
+}
+stripplot(mice_mod,pch = 20, cex = 1.5,strip = no_strip,layout = c(6, 4)) #View the interpolation
+
+
+paste(colnames(data),collapse = "+")
+medelFit1 <- with(mice_mod, glm(Chlorophyll ~ Species+Water+CNMs+Dimension+Shape+Length+Diameter+Thickness+Medium+RPM+Modification+Dispersant+Duration+LightI+Temperature+LightD+Conc.+N, family = gaussian()))
+medelFit1
+summary(medelFit1, type = "glance") #Selective data set
+
+mice_data <- complete(mice_mod,action = 3)
+
+#### Recursive feature elimination ====
+#Max-min standardization
+
+normalize <- function(x) {
+  return ((x - min(x)) / (max(x) - min(x)))
+}
+stand_data <- as.data.frame(lapply(mice_data,normalize))
+
+#Divide the test set
+set.seed(12345678)
+train_Index <-  createDataPartition(stand_data$Chlorophyll, p = .6,   #分层抽样划分验证集
+                                    list = F,
+                                    times = 1)
+train_data <- stand_data[train_Index,]
+cross_data <- stand_data[-train_Index,]
+
+validate_Index = createDataPartition(cross_data$Chlorophyll, p = .5,   #分层抽样划分验证集
+                                     list = F,
+                                     times = 1)
+test_data <- cross_data[validate_Index,]
+validate_data <- cross_data[-validate_Index,]
+
+rownames(train_data) <- 1:nrow(train_data)  #重置序号
+rownames(validate_data) <- 1:nrow(validate_data)
+rownames(test_data) <- 1:nrow(test_data)
+
+#Variable selection
+subsets <- 1:(ncol(train_data)-2)
+ctrl <- rfeControl(functions = rfFuncs, method = "CV", number = 10)
+set.seed(123456789)
+Profile <- rfe(x = train_data[-ncol(train_data)],
+               y = train_data$Chlorophyll,
+               metric = "Rsquared",
+               sizes = subsets,
+               rfeControl = ctrl)
+
+Profile$optVariables
+profile_result <- Profile$results
+
+optVariables <- Profile$optVariables
+validate_data <- validate_data[,c(optVariables,"Chlorophyll")]
+train_data <- train_data[,c(optVariables,"Chlorophyll")]
+test_data <- test_data[,c(optVariables,"Chlorophyll")]
+
+
+#R2
+r2_general <-function(preds,actual){
+  return(1- sum((preds - actual) ^ 2)/sum((actual - mean(actual))^2))
+}
+
+r2_data <- as.data.frame(matrix(nrow = 6,ncol = 12))
+r2_data[12] <- c("RF","SVM","knn","xgb","cat","light")
+
+#### RF ====
+RF_FUN <- function(ntree,mtry,nodesize,maxnodes){
+  rf_f <- randomForest(Chlorophyll ~.,
+                       data = train_data,
+                       important = F,
+                       proximity = T,
+                       ntree = ntree,
+                       mtry = mtry,
+                       nodesize = nodesize,
+                       maxnodes = maxnodes)
+  list(Score = r2_general(predict(rf_f,validate_data),validate_data$Chlorophyll),
+       Pred = predict(rf_f,validate_data))
+}
+
+set.seed(12345678)
+OPT_RF <- BayesianOptimization(RF_FUN,
+                               bounds = list(ntree = c(100L,500L),
+                                             mtry = c(2L,9L),
+                                             nodesize = c(1L,15L),
+                                             maxnodes = c(100L,230L)),
+                               init_grid_dt = NULL,
+                               init_points = 50,
+                               n_iter = 50,
+                               acq = "ucb",
+                               kappa = 2.576,
+                               eps = 0.0,
+                               verbose = T)
+set.seed(12345678)
+rf_f <- randomForest(Chlorophyll ~.,
+                     data = train_data,
+                     important = F,
+                     proximity = T,
+                     ntree = OPT_RF$Best_Par[c("ntree")],
+                     mtry = OPT_RF$Best_Par[c("mtry")],
+                     nodesize = OPT_RF$Best_Par[c("nodesize")],
+                     maxnodes = OPT_RF$Best_Par[c("maxnodes")])
+r2_data[1,1] <- OPT_RF$Best_Par[c("ntree")]
+r2_data[1,2] <- OPT_RF$Best_Par[c("mtry")]
+r2_data[1,3] <- OPT_RF$Best_Par[c("nodesize")]
+r2_data[1,4] <- OPT_RF$Best_Par[c("maxnodes")]
+r2_data[1,5] <- r2_general(rf_f$predicted,train_data$Chlorophyll)
+r2_data[1,6] <- r2_general(predict(rf_f,validate_data),validate_data$Chlorophyll)
+r2_data[1,7] <- r2_general(predict(rf_f,test_data),test_data$Chlorophyll)
+
+
+#### SVM ====
+
+SVM_FUN <- function(gamma,cost){
+  svm_f <- svm(Chlorophyll ~.,
+               data = train_data,
+               scale = F,
+               type = "eps-regression",
+               kernel = "radial",
+               gamma = 10^gamma,
+               C = 10^cost)
+  list(Score = r2_general(predict(svm_f,validate_data),validate_data$Chlorophyll),
+       Pred = predict(svm_f,validate_data))
+}
+set.seed(12345678)
+OPT_SVM <- BayesianOptimization(SVM_FUN,
+                                bounds = list(gamma = c(-4,1),
+                                              cost = c(-4,1)),
+                                init_grid_dt = NULL,
+                                init_points = 50,
+                                n_iter = 50,
+                                acq = "ucb",
+                                kappa = 2.576,
+                                eps = 0.0,
+                                verbose = T)
+set.seed(12345678)
+svm_f <- svm(Chlorophyll ~.,
+             data = train_data,
+             scale = F,
+             type = "eps-regression",
+             kernel = "radial",
+             gamma = 10^OPT_SVM$Best_Par[c("gamma")],
+             C = 10^OPT_SVM$Best_Par[c("cost")])
+r2_data[2,1] <- 10^OPT_SVM$Best_Par[c("gamma")]
+r2_data[2,2] <- 10^OPT_SVM$Best_Par[c("cost")]
+r2_data[2,3] <- r2_general(svm_f$decision.values,train_data$Chlorophyll)
+r2_data[2,4] <- r2_general(predict(svm_f,validate_data),validate_data$Chlorophyll)
+r2_data[2,5] <- r2_general(predict(svm_f,test_data),test_data$Chlorophyll)
+
+#### knn ====
+
+KNN_FUN <- function(k){
+  knn_f <- knnreg(Chlorophyll ~.,
+                  data = train_data,
+                  k = k)
+  list(Score = r2_general(predict(knn_f,validate_data),validate_data$Chlorophyll),
+       Pred = predict(knn_f,validate_data))
+}
+set.seed(12345678)
+OPT_KNN <- BayesianOptimization(KNN_FUN,
+                                bounds = list(k = c(1L,200L)),
+                                init_grid_dt = NULL,
+                                init_points = 50,
+                                n_iter = 50,
+                                acq = "ucb",
+                                kappa = 2.576,
+                                eps = 0.0,
+                                verbose = T)
+set.seed(12345678)
+knn_f <- knnreg(Chlorophyll ~.,
+                data = train_data,
+                k = OPT_KNN$Best_Par[c("k")])
+r2_data[3,1] <- OPT_KNN$Best_Par[c("k")]
+r2_data[3,2] <- r2_general(predict(knn_f,train_data),train_data$Chlorophyll)
+r2_data[3,3] <- r2_general(predict(knn_f,validate_data),validate_data$Chlorophyll)
+r2_data[3,4] <- r2_general(predict(knn_f,test_data),test_data$Chlorophyll)
+
+#### xgb ====
+
+xgbtraindata <- xgb.DMatrix(data = data.matrix(select(train_data,-Chlorophyll)),
+                            label = train_data$Chlorophyll)
+xgbtestdata <- xgb.DMatrix(data = data.matrix(select(test_data,-Chlorophyll)),
+                           label = test_data$Chlorophyll)
+xgbvalidatedata <- xgb.DMatrix(data = data.matrix(select(validate_data,-Chlorophyll)),
+                               label = validate_data$Chlorophyll)
+XGB_FUN <- function(eta,max_depth,min_child_weight,gamma,subsample,colsample_bytree){
+  xgb_f <- xgboost(data = xgbtraindata,
+                   eta = eta,
+                   max_depth = max_depth,
+                   min_child_weight = min_child_weight,
+                   gamma = gamma,
+                   subsample = subsample,
+                   colsample_bytree = colsample_bytree,
+                   objective = "reg:squarederror",
+                   nrounds = 1000,
+                   early_stopping_rounds = 200,
+                   verbose = 0)
+  list(Score = r2_general(predict(xgb_f,xgbvalidatedata),validate_data$Chlorophyll),
+       Pred = predict(xgb_f,xgbvalidatedata))
+}
+set.seed(12345678)
+OPT_XGB <- BayesianOptimization(XGB_FUN,
+                                bounds = list(eta = c(0.01,0.3),
+                                              max_depth = c(3L,10L),
+                                              min_child_weight = c(0.5,1.5),
+                                              gamma = c(0,0.2),
+                                              subsample = c(0.5,1),
+                                              colsample_bytree = c(0.5,1)),
+                                init_grid_dt = NULL,
+                                init_points = 50,
+                                n_iter = 50,
+                                acq = "ucb",
+                                kappa = 2.576,
+                                eps = 0.0,
+                                verbose = T)
+set.seed(12345678)
+xgb_f <- xgboost(data = xgbtraindata,
+                 eta = OPT_XGB$Best_Par[c("eta")],
+                 max_depth = OPT_XGB$Best_Par[c("max_depth")],
+                 min_child_weight = OPT_XGB$Best_Par[c("min_child_weight")],
+                 gamma = OPT_XGB$Best_Par[c("gamma")],
+                 subsample = OPT_XGB$Best_Par[c("subsample")],
+                 colsample_bytree = OPT_XGB$Best_Par[c("colsample_bytree")],
+                 objective = "reg:squarederror",
+                 nrounds = 1000,
+                 early_stopping_rounds = 200,
+                 verbose = 0)
+r2_data[4,1] <- OPT_XGB$Best_Par[c("eta")]
+r2_data[4,2] <- OPT_XGB$Best_Par[c("max_depth")]
+r2_data[4,3] <- OPT_XGB$Best_Par[c("min_child_weight")]
+r2_data[4,4] <- OPT_XGB$Best_Par[c("gamma")]
+r2_data[4,5] <- OPT_XGB$Best_Par[c("subsample")]
+r2_data[4,6] <- OPT_XGB$Best_Par[c("colsample_bytree")]
+r2_data[4,7] <- r2_general(predict(xgb_f,xgbtraindata),train_data$Chlorophyll)
+r2_data[4,8] <- OPT_XGB$Best_Value
+r2_data[4,9] <- r2_general(predict(xgb_f,xgbtestdata),test_data$Chlorophyll)
+
+#### cat ====
+library(catboost)
+
+cattraindata <- catboost.load_pool(data = data.matrix(select(train_data,-Chlorophyll)),
+                                   label = train_data$Chlorophyll)
+cattestdata <- catboost.load_pool(data = data.matrix(select(test_data,-Chlorophyll)),
+                                  label = test_data$Chlorophyll)
+catvalidatedata <- catboost.load_pool(data = data.matrix(select(validate_data,-Chlorophyll)),
+                                      label = validate_data$Chlorophyll)
+
+CAT_FUN <- function(iterations,learning_rate,depth,bagging_temperature,subsample,l2_leaf_reg,random_strength){
+  cat_f <- catboost.train(learn_pool = cattraindata,
+                          params = list(iterations = iterations,
+                                        learning_rate = learning_rate,
+                                        depth = depth,
+                                        bagging_temperature = bagging_temperature,
+                                        subsample = subsample,
+                                        l2_leaf_reg = l2_leaf_reg,
+                                        random_strength = random_strength,
+                                        od_wait = 100,
+                                        random_seed = 12345678,
+                                        verbose = 0))
+  list(Score = r2_general(catboost.predict(cat_f,catvalidatedata),validate_data$Chlorophyll),
+       Pred = catboost.predict(cat_f,catvalidatedata))
+}
+
+set.seed(12345678)
+OPT_CAT <- BayesianOptimization(CAT_FUN,
+                                bounds = list(iterations = c(100L,1200L),
+                                              learning_rate = c(0.01,0.3),
+                                              depth = c(4L,12L),
+                                              bagging_temperature = c(0,1),
+                                              subsample = c(0.5,1),
+                                              l2_leaf_reg = c(0.01,4),
+                                              random_strength = c(0.5,1.5)),
+                                init_grid_dt = NULL,
+                                init_points = 50,
+                                n_iter = 50,
+                                acq = "ucb",
+                                kappa = 2.576,
+                                eps = 0.0,
+                                verbose = T)
+set.seed(12345678)
+cat_f <- catboost.train(learn_pool = cattraindata,
+                        params = list(iterations = OPT_CAT$Best_Par[c("iterations")],
+                                      learning_rate = OPT_CAT$Best_Par[c("learning_rate")],
+                                      depth = OPT_CAT$Best_Par[c("depth")],
+                                      bagging_temperature = OPT_CAT$Best_Par[c("bagging_temperature")],
+                                      subsample = OPT_CAT$Best_Par[c("subsample")],
+                                      l2_leaf_reg = OPT_CAT$Best_Par[c("l2_leaf_reg")],
+                                      random_strength = OPT_CAT$Best_Par[c("random_strength")],
+                                      od_wait = 100,
+                                      random_seed = 12345678,
+                                      verbose = 0))
+r2_data[5,1] <- OPT_CAT$Best_Par[c("iterations")]
+r2_data[5,2] <- OPT_CAT$Best_Par[c("learning_rate")]
+r2_data[5,3] <- OPT_CAT$Best_Par[c("depth")]
+r2_data[5,4] <- OPT_CAT$Best_Par[c("bagging_temperature")]
+r2_data[5,5] <- OPT_CAT$Best_Par[c("subsample")]
+r2_data[5,6] <- OPT_CAT$Best_Par[c("l2_leaf_reg")]
+r2_data[5,7] <- OPT_CAT$Best_Par[c("random_strength")]
+r2_data[5,8] <- r2_general(catboost.predict(cat_f,cattraindata),train_data$Chlorophyll)
+r2_data[5,9] <- OPT_CAT$Best_Value
+r2_data[5,10] <- r2_general(catboost.predict(cat_f,cattestdata),test_data$Chlorophyll)
+
+#### light ====
+library(lightgbm)
+
+lighttraindata <- lgb.Dataset(data = data.matrix(select(train_data,-Chlorophyll)),
+                              label = train_data$Chlorophyll)
+lighttestdata <- lgb.Dataset(data = data.matrix(select(test_data,-Chlorophyll)),
+                             label = test_data$Chlorophyll)
+lightvalidatedata <- lgb.Dataset(data = data.matrix(select(validate_data,-Chlorophyll)),
+                                 label = validate_data$Chlorophyll)
+
+LIGHT_FUN <- function(learning_rate,max_depth,num_leaves,subsample,colsample_bytree,num_iterations){
+  light_f <- lgb.train(data = lighttraindata,
+                       params = list(boosting_type = 'gbdt',
+                                     objective = 'regression',
+                                     learning_rate = learning_rate,
+                                     max_depth = max_depth,
+                                     num_leaves = num_leaves,
+                                     subsample = subsample,
+                                     colsample_bytree = colsample_bytree,
+                                     num_iterations = num_iterations),
+                       verbose = -1)
+  list(Score = r2_general(predict(light_f,data.matrix(select(validate_data,-Chlorophyll))),validate_data$Chlorophyll),
+       Pred = predict(light_f,data.matrix(select(validate_data,-Chlorophyll))))
+}
+
+OPT_LIGHT <- BayesianOptimization(LIGHT_FUN,
+                                  bounds = list(learning_rate = c(0.01,0.1),
+                                                max_depth = c(5L,25L),
+                                                num_leaves = c(5L,60L),
+                                                subsample = c(0.5,1),
+                                                colsample_bytree = c(0.5,1),
+                                                num_iterations = c(100L,1000L)),
+                                  init_grid_dt = NULL,
+                                  init_points = 50,
+                                  n_iter = 50,
+                                  acq = "ucb",
+                                  kappa = 2.576,
+                                  eps = 0.0,
+                                  verbose = T)
+
+light_f <- lgb.train(data = lighttraindata,
+                     params = list(boosting_type = 'gbdt',
+                                   objective = 'regression',
+                                   learning_rate = OPT_LIGHT$Best_Par["learning_rate"],
+                                   max_depth = OPT_LIGHT$Best_Par["max_depth"],
+                                   num_leaves = OPT_LIGHT$Best_Par["num_leaves"],
+                                   subsample = OPT_LIGHT$Best_Par["subsample"],
+                                   colsample_bytree = OPT_LIGHT$Best_Par["colsample_bytree"],
+                                   num_iterations = OPT_LIGHT$Best_Par["num_iterations"]),
+                     verbose = -1)
+
+r2_data[6,1] <- OPT_LIGHT$Best_Par["learning_rate"]
+r2_data[6,2] <- OPT_LIGHT$Best_Par["max_depth"]
+r2_data[6,3] <- OPT_LIGHT$Best_Par["num_leaves"]
+r2_data[6,4] <- OPT_LIGHT$Best_Par["subsample"]
+r2_data[6,5] <- OPT_LIGHT$Best_Par["colsample_bytree"]
+r2_data[6,6] <- OPT_LIGHT$Best_Par["num_iterations"]
+r2_data[6,7] <- r2_general(predict(light_f,data.matrix(select(train_data,-Chlorophyll))),train_data$Chlorophyll)
+r2_data[6,8] <- OPT_LIGHT$Best_Value
+r2_data[6,9] <- r2_general(predict(light_f,data.matrix(select(test_data,-Chlorophyll))),test_data$Chlorophyll)
+
+r2_data
